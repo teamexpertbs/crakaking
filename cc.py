@@ -44,9 +44,9 @@ def keep_alive():
 # --- End Flask Keep Alive ---
 
 # --- Configuration ---
-TOKEN = '7951330550:AAGdyhwZwX9rKsT6Yn8YGhp-MSdVZbimVtg'
-OWNER_ID = 7575315425
-ADMIN_ID = 7575315425
+TOKEN = os.environ.get('BOT_TOKEN','7951330550:AAGdyhwZwX9rKsT6Yn8YGhp-MSdVZbimVtg')
+OWNER_ID = int(os.environ.get('OWNER_ID','7575315425'))
+ADMIN_ID = int(os.environ.get('ADMIN_ID','7575315425'))
 YOUR_USERNAME = '@DM_CRAKA_OWNER_BOT'
 UPDATE_CHANNEL = 'https://t.me/crakasm'
 
