@@ -44,7 +44,7 @@ def keep_alive():
 # --- End Flask Keep Alive ---
 
 # --- Configuration ---
-TOKEN = os.environ.get('BOT_TOKEN','7951330550:AAGdyhwZwX9rKsT6Yn8YGhp-MSdVZbimVtg')
+TOKEN = os.environ.get('BOT_TOKEN','7951330550:AAGdbX8bRsTL8pXGt3fFUUYOheP_VfLOeQs')
 OWNER_ID = int(os.environ.get('OWNER_ID','7575315425'))
 ADMIN_ID = int(os.environ.get('ADMIN_ID','7575315425'))
 YOUR_USERNAME = '@DM_CRAKA_OWNER_BOT'
@@ -75,6 +75,7 @@ user_subscriptions = {}
 user_files = {}
 active_users = set()
 admin_ids = {ADMIN_ID, OWNER_ID}
+approved_users = set()  # Users approved by admin to host files
 bot_locked = False
 
 # --- Malware Detection Configuration ---
@@ -149,6 +150,8 @@ def init_db():
                      (user_id INTEGER PRIMARY KEY)''')
         c.execute('''CREATE TABLE IF NOT EXISTS admins
                      (user_id INTEGER PRIMARY KEY)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS approved_users
+                     (user_id INTEGER PRIMARY KEY)''')
         c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (OWNER_ID,))
         if ADMIN_ID != OWNER_ID:
             c.execute('INSERT OR IGNORE INTO admins (user_id) VALUES (?)', (ADMIN_ID,))
@@ -188,8 +191,12 @@ def load_data():
         c.execute('SELECT user_id FROM admins')
         admin_ids.update(user_id for (user_id,) in c.fetchall())
 
+        # Load approved users
+        c.execute('SELECT user_id FROM approved_users')
+        approved_users.update(user_id for (user_id,) in c.fetchall())
+
         conn.close()
-        logger.info(f"Data loaded: {len(active_users)} users, {len(user_subscriptions)} subscriptions, {len(admin_ids)} admins.")
+        logger.info(f"Data loaded: {len(active_users)} users, {len(user_subscriptions)} subscriptions, {len(admin_ids)} admins, {len(approved_users)} approved users.")
     except Exception as e:
         logger.error(f"❌ Error loading data: {e}", exc_info=True)
 
@@ -874,6 +881,40 @@ def remove_admin_db(admin_id):
         except sqlite3.Error as e: logger.error(f"❌ SQLite error removing admin {admin_id}: {e}"); return False
         except Exception as e: logger.error(f"❌ Unexpected error removing admin {admin_id}: {e}", exc_info=True); return False
         finally: conn.close()
+def approve_user_db(user_id):
+    """Approve a user to host files"""
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        try:
+            c.execute('INSERT OR IGNORE INTO approved_users (user_id) VALUES (?)', (user_id,))
+            conn.commit()
+            approved_users.add(user_id)
+            logger.info(f"Approved user {user_id} to host files.")
+        except sqlite3.Error as e: logger.error(f"❌ SQLite error approving user {user_id}: {e}")
+        except Exception as e: logger.error(f"❌ Unexpected error approving user {user_id}: {e}", exc_info=True)
+        finally: conn.close()
+
+def revoke_user_db(user_id):
+    """Revoke a user's hosting permission"""
+    with DB_LOCK:
+        conn = sqlite3.connect(DATABASE_PATH, check_same_thread=False)
+        c = conn.cursor()
+        try:
+            c.execute('DELETE FROM approved_users WHERE user_id = ?', (user_id,))
+            conn.commit()
+            approved_users.discard(user_id)
+            logger.info(f"Revoked hosting permission for user {user_id}.")
+        except sqlite3.Error as e: logger.error(f"❌ SQLite error revoking user {user_id}: {e}")
+        except Exception as e: logger.error(f"❌ Unexpected error revoking user {user_id}: {e}", exc_info=True)
+        finally: conn.close()
+
+def is_user_approved(user_id):
+    """Check if a user is approved to host files (admins and owner are always approved)"""
+    if user_id == OWNER_ID or user_id in admin_ids:
+        return True
+    return user_id in approved_users
+
 # --- End Database Operations ---
 
 # --- Menu creation (Inline and ReplyKeyboards) ---
@@ -951,6 +992,11 @@ def create_admin_panel():
         types.InlineKeyboardButton('➖ Remove Admin', callback_data='remove_admin')
     )
     markup.row(types.InlineKeyboardButton('📋 List Admins', callback_data='list_admins'))
+    markup.row(
+        types.InlineKeyboardButton('✅ Approve User', callback_data='approve_user'),
+        types.InlineKeyboardButton('❌ Revoke User', callback_data='revoke_user')
+    )
+    markup.row(types.InlineKeyboardButton('📋 List Approved', callback_data='list_approved'))
     markup.row(types.InlineKeyboardButton('🔙 Back to Main', callback_data='back_to_main'))
     return markup
 
@@ -1578,6 +1624,27 @@ def handle_file_upload_doc(message):
         bot.reply_to(message, "⚠️ Bot locked, cannot accept files.")
         return
 
+    # --- Admin Approval Check ---
+    if not is_user_approved(user_id):
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton(
+            f'📞 Admin se Permission Lo → {YOUR_USERNAME}',
+            url=f'https://t.me/{YOUR_USERNAME.replace("@", "")}'
+        ))
+        bot.reply_to(
+            message,
+            f"🚫 *Permission Nahi Hai!*\n\n"
+            f"Aap abhi file host nahi kar sakte.\n"
+            f"File upload karne ke liye pehle *Admin se permission leni hogi*.\n\n"
+            f"👇 Neeche button dabao aur Admin se request karo:\n"
+            f"📩 Apna *User ID* bhi bhejna: `{user_id}`",
+            parse_mode='Markdown',
+            reply_markup=markup
+        )
+        logger.info(f"Blocked unapproved user {user_id} from uploading file.")
+        return
+    # --- End Approval Check ---
+
     file_limit = get_user_file_limit(user_id)
     current_files = get_user_file_count(user_id)
     if current_files >= file_limit:
@@ -1675,7 +1742,11 @@ def handle_callbacks(call):
         elif data == 'list_admins': admin_required_callback(call, list_admins_callback)
         elif data == 'add_subscription': admin_required_callback(call, add_subscription_init_callback) 
         elif data == 'remove_subscription': admin_required_callback(call, remove_subscription_init_callback) 
-        elif data == 'check_subscription': admin_required_callback(call, check_subscription_init_callback) 
+        elif data == 'check_subscription': admin_required_callback(call, check_subscription_init_callback)
+        # --- User Approval Callbacks ---
+        elif data == 'approve_user': admin_required_callback(call, approve_user_init_callback)
+        elif data == 'revoke_user': admin_required_callback(call, revoke_user_init_callback)
+        elif data == 'list_approved': admin_required_callback(call, list_approved_callback)
         else:
             bot.answer_callback_query(call.id, "Unknown action.")
             logger.warning(f"Unhandled callback data: {data} from user {user_id}")
@@ -2320,6 +2391,101 @@ def admin_panel_callback(call):
         bot.edit_message_text("👑 Admin Panel\nManage admins (Owner actions may be restricted).",
                               call.message.chat.id, call.message.message_id, reply_markup=create_admin_panel())
     except Exception as e: logger.error(f"Error showing admin panel: {e}")
+
+# --- User Approval Callback Functions ---
+def approve_user_init_callback(call):
+    bot.answer_callback_query(call.id)
+    msg = bot.send_message(call.message.chat.id,
+        "✅ *User Approve Karo*\n\nUser ka Chat ID enter karo jise hosting ki permission deni hai:\n/cancel to abort.",
+        parse_mode='Markdown')
+    bot.register_next_step_handler(msg, process_approve_user_id)
+
+def process_approve_user_id(message):
+    admin_id_check = message.from_user.id
+    if admin_id_check not in admin_ids:
+        bot.reply_to(message, "⚠️ Admin permissions required."); return
+    if message.text.strip().lower() == '/cancel':
+        bot.reply_to(message, "Approval cancelled."); return
+    try:
+        target_user_id = int(message.text.strip())
+        if target_user_id <= 0: raise ValueError("ID must be positive")
+        if target_user_id in approved_users:
+            bot.reply_to(message, f"⚠️ User `{target_user_id}` already approved.", parse_mode='Markdown'); return
+        approve_user_db(target_user_id)
+        logger.info(f"User {target_user_id} approved by admin {admin_id_check}.")
+        bot.reply_to(message, f"✅ User `{target_user_id}` ko file hosting ki permission de di gayi!", parse_mode='Markdown')
+        try:
+            bot.send_message(target_user_id,
+                "🎉 *Mubarak Ho!*\n\n"
+                "Admin ne aapko file hosting ki permission de di hai!\n"
+                "Ab aap apni `.py`, `.js`, ya `.zip` files upload karke host kar sakte ho.\n\n"
+                "👉 /start dabao aur shuru karo!",
+                parse_mode='Markdown')
+        except Exception as e:
+            logger.error(f"Failed to notify approved user {target_user_id}: {e}")
+            bot.reply_to(message, f"✅ Approved! (User ko notify nahi kar saka: {e})")
+    except ValueError:
+        bot.reply_to(message, "⚠️ Invalid ID. Sirf numerical Chat ID bhejo ya /cancel.")
+        msg = bot.send_message(message.chat.id, "✅ User ka Chat ID dobara enter karo ya /cancel.")
+        bot.register_next_step_handler(msg, process_approve_user_id)
+    except Exception as e:
+        logger.error(f"Error approving user: {e}", exc_info=True)
+        bot.reply_to(message, f"❌ Error: {e}")
+
+def revoke_user_init_callback(call):
+    bot.answer_callback_query(call.id)
+    msg = bot.send_message(call.message.chat.id,
+        "❌ *User ki Permission Hatao*\n\nUser ka Chat ID enter karo jisi permission revoke karni hai:\n/cancel to abort.",
+        parse_mode='Markdown')
+    bot.register_next_step_handler(msg, process_revoke_user_id)
+
+def process_revoke_user_id(message):
+    admin_id_check = message.from_user.id
+    if admin_id_check not in admin_ids:
+        bot.reply_to(message, "⚠️ Admin permissions required."); return
+    if message.text.strip().lower() == '/cancel':
+        bot.reply_to(message, "Revoke cancelled."); return
+    try:
+        target_user_id = int(message.text.strip())
+        if target_user_id <= 0: raise ValueError("ID must be positive")
+        if target_user_id == OWNER_ID or target_user_id in admin_ids:
+            bot.reply_to(message, "⚠️ Owner/Admin ki permission revoke nahi ho sakti."); return
+        if target_user_id not in approved_users:
+            bot.reply_to(message, f"⚠️ User `{target_user_id}` approved list mein nahi hai.", parse_mode='Markdown'); return
+        revoke_user_db(target_user_id)
+        logger.info(f"User {target_user_id} permission revoked by admin {admin_id_check}.")
+        bot.reply_to(message, f"✅ User `{target_user_id}` ki hosting permission hat gayi.", parse_mode='Markdown')
+        try:
+            bot.send_message(target_user_id,
+                "ℹ️ *Permission Revoke Ho Gayi*\n\n"
+                "Admin ne aapki file hosting permission hatai hai.\n"
+                "Agar galti se hua hai toh admin se contact karo.",
+                parse_mode='Markdown')
+        except Exception as e:
+            logger.error(f"Failed to notify revoked user {target_user_id}: {e}")
+    except ValueError:
+        bot.reply_to(message, "⚠️ Invalid ID. Sirf numerical Chat ID bhejo ya /cancel.")
+        msg = bot.send_message(message.chat.id, "❌ User ka Chat ID dobara enter karo ya /cancel.")
+        bot.register_next_step_handler(msg, process_revoke_user_id)
+    except Exception as e:
+        logger.error(f"Error revoking user: {e}", exc_info=True)
+        bot.reply_to(message, f"❌ Error: {e}")
+
+def list_approved_callback(call):
+    bot.answer_callback_query(call.id)
+    try:
+        if not approved_users:
+            approved_list_str = "(Koi approved user nahi hai)"
+        else:
+            approved_list_str = "\n".join(f"- `{uid}`" for uid in sorted(approved_users))
+        bot.edit_message_text(
+            f"✅ Approved Users (File Host Kar Sakte Hain):\n\n{approved_list_str}\n\n"
+            f"(Note: Owner & Admins hamesha approved hote hain)",
+            call.message.chat.id, call.message.message_id,
+            reply_markup=create_admin_panel(), parse_mode='Markdown'
+        )
+    except Exception as e: logger.error(f"Error listing approved users: {e}")
+# --- End User Approval Callbacks ---
 
 def add_admin_init_callback(call):
     bot.answer_callback_query(call.id)
